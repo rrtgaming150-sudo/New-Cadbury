@@ -6,7 +6,7 @@ import hashlib
 import time
 import urllib.parse
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
 import asyncio
@@ -15,28 +15,27 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 # ================= CONFIG =================
-THREADS = 500
+THREADS = 200  # Reduced for Render free tier (0.1 CPU, 512MB RAM)
 CODE_LENGTH = 8
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-NOTVALID_FILE = "notvalid.txt"       # global invalid codes
-VALID_FILE = "valid_codes.txt"        # global valid codes
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")     # Set BOT_TOKEN in Replit Secrets
+NOTVALID_FILE = "notvalid.txt"
+VALID_FILE = "valid_codes.txt"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # =========================================
 
-# Flask app for Render health checks
 flask_app = Flask(__name__)
 
 # Per-user state
 user_data = {}
 user_lock = threading.Lock()
-main_loop = None  # global event loop reference for thread-safe coroutine scheduling
+bot_application = None
+main_loop = None
 
-# Global file management (shared across users)
+# Global file management
 global_tried_codes = set()
 global_valid_codes = set()
 file_lock = threading.Lock()
 
-# ---------- File loading / saving ----------
 def load_global_files():
     global global_tried_codes, global_valid_codes
     if os.path.exists(NOTVALID_FILE):
@@ -76,7 +75,7 @@ def mark_code_tried(code, is_valid=False):
         if is_valid:
             global_valid_codes.add(code)
 
-# ---------- API functions (no proxy) ----------
+# ---------- API functions ----------
 def generate_signature_data(payload, user_key, data_key):
     payload_str = json.dumps(payload, separators=(',', ':'))
     a = base64.b64encode(payload_str.encode('utf-8')).decode('utf-8')
@@ -141,7 +140,6 @@ def update_user_stats(user_id, is_valid, error_type=None):
                 ud["error_other"] += 1
         ud["total_checked"] += 1
 
-        # Auto-report every 500 checks
         if ud["total_checked"] - ud["last_report"] >= 500:
             ud["last_report"] = ud["total_checked"]
             report_text = (
@@ -158,12 +156,11 @@ def update_user_stats(user_id, is_valid, error_type=None):
 
 async def send_message(chat_id, text):
     try:
-        await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        await bot_application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception as e:
         print(f"Failed to send message to {chat_id}: {e}")
 
 def try_random_code(user_id):
-    """Called by each thread – checks one random code per call."""
     while True:
         with user_lock:
             ud = user_data.get(user_id)
@@ -173,7 +170,6 @@ def try_random_code(user_id):
             user_key = ud["user_key"]
             data_key = ud["data_key"]
             access_token = ud["access_token"]
-        # Generate unique code (global)
         while True:
             code = ''.join(random.choice(CHARSET) for _ in range(CODE_LENGTH))
             if not is_code_tried(code):
@@ -247,7 +243,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "mobile": None,
             }
         already_logged_in = bool(user_data[user_id].get("access_token"))
-
     if already_logged_in:
         await update.message.reply_text(
             f"✅ Already logged in as `{user_data[user_id].get('mobile')}`.\n\nWhat would you like to do?",
@@ -255,14 +250,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return ConversationHandler.END
-
     await update.message.reply_text(
         "Welcome to Cadbury Lolly Rewards Code Checker Bot!\n\n"
         "Press *Login* to begin, or send your mobile number directly (e.g., 9674662450).",
         reply_markup=make_main_keyboard(),
         parse_mode="Markdown"
     )
-    return 1  # wait for mobile
+    return 1
 
 async def mobile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
@@ -303,8 +297,6 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         access_token = verify_otp(session, otp, user_key, data_key)
         if access_token:
             with user_lock:
-                ud["user_key"] = user_key
-                ud["data_key"] = data_key
                 ud["access_token"] = access_token
             await update.message.reply_text("✅ Login successful! You can now use the buttons to start checking.")
         else:
@@ -313,16 +305,7 @@ async def otp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Error: {e}\nPlease /start again.")
         return ConversationHandler.END
-
-    # Show main menu again
-    keyboard = [
-        [InlineKeyboardButton("🔑 Login", callback_data="login")],
-        [InlineKeyboardButton("🚀 Start Checking", callback_data="start_check")],
-        [InlineKeyboardButton("⏹️ Stop Checking", callback_data="stop_check")],
-        [InlineKeyboardButton("📊 Show Stats", callback_data="stats")],
-        [InlineKeyboardButton("❓ Explanation", callback_data="explain")]
-    ]
-    await update.message.reply_text("Main menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Main menu:", reply_markup=make_main_keyboard())
     return ConversationHandler.END
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -330,13 +313,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = update.effective_chat.id
     data = query.data
-
     with user_lock:
         ud = user_data.get(user_id)
         if not ud:
             await query.edit_message_text("Please /start first.")
             return
-
     if data == "login":
         await query.edit_message_text("Please send your mobile number (e.g., 9674662450):")
         with user_lock:
@@ -349,7 +330,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "last_report": 0, "checking_active": False,
                     "executor": None, "futures": [], "mobile": None,
                 }
-        context.user_data["awaiting_login_mobile"] = True
         return
     elif data == "start_check":
         if not ud.get("access_token"):
@@ -396,7 +376,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         explanation = (
             "*What is a 'thread'?*\n"
             "A thread is like a separate worker that can do one task at a time. "
-            "If you use 500 threads, your computer works as if 500 people are simultaneously "
+            "If you use many threads, your computer works as if many people are simultaneously "
             "trying random codes. This speeds up checking dramatically.\n\n"
             "*Error types:*\n"
             "• HTTP 503 – The server is overloaded (temporary).\n"
@@ -431,7 +411,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ---------- Flask routes for Render ----------
+# ---------- Flask routes ----------
 @flask_app.route('/')
 def index():
     return "Cadbury Lolly Rewards Bot is running!", 200
@@ -441,12 +421,11 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 # ---------- Main entry point ----------
-async def run_bot():
-    """Start the Telegram bot in polling mode."""
-    global application
+def run_bot():
+    global bot_application, main_loop
     try:
-        print(f"Starting bot with token: {BOT_TOKEN[:10]}...")
-        application = Application.builder().token(BOT_TOKEN).build()
+        print("Starting Telegram bot...")
+        bot_application = Application.builder().token(BOT_TOKEN).build()
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("start", start)],
             states={
@@ -455,32 +434,26 @@ async def run_bot():
             },
             fallbacks=[],
         )
-        application.add_handler(conv_handler)
-        application.add_handler(CallbackQueryHandler(button_callback, pattern="^(login|start_check|stop_check|stats|explain)$"))
-        application.add_handler(CommandHandler("status", status))
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
+        bot_application.add_handler(conv_handler)
+        bot_application.add_handler(CallbackQueryHandler(button_callback, pattern="^(login|start_check|stop_check|stats|explain)$"))
+        bot_application.add_handler(CommandHandler("status", status))
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        main_loop = loop
+        loop.run_until_complete(bot_application.initialize())
+        loop.run_until_complete(bot_application.start())
+        loop.run_until_complete(bot_application.updater.start_polling())
         print("Bot polling started successfully!")
-        # Keep running
-        while True:
-            await asyncio.sleep(3600)
+        loop.run_forever()
     except Exception as e:
         print(f"Bot startup error: {e}")
 
 if __name__ == "__main__":
     load_global_files()
-    # Start the Telegram bot in a background asyncio task
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    main_loop = loop  # expose to threads for run_coroutine_threadsafe
-    bot_task = loop.create_task(run_bot())
-    # Run Flask in a separate thread (to satisfy Render's port requirement)
-    from threading import Thread
-    def run_flask():
-        port = int(os.environ.get("PORT", 5000))
-        flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-    flask_thread = Thread(target=run_flask)
-    flask_thread.start()
-    # Run asyncio loop forever
-    loop.run_forever()
+    # Start Telegram bot in a separate background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    # Run Flask in the main thread (Render expects this)
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
