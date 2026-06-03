@@ -15,7 +15,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 # ================= CONFIG =================
-THREADS = 200  # Reduced for Render free tier (0.1 CPU, 512MB RAM)
+THREADS = 200
 CODE_LENGTH = 8
 CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 NOTVALID_FILE = "notvalid.txt"
@@ -38,19 +38,31 @@ file_lock = threading.Lock()
 
 def load_global_files():
     global global_tried_codes, global_valid_codes
+    # Load invalid codes
     if os.path.exists(NOTVALID_FILE):
         with open(NOTVALID_FILE, "r", encoding="utf-8") as f:
             for line in f:
-                code = line.strip().split()[0]
-                if code:
-                    global_tried_codes.add(code)
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if parts:
+                    code = parts[0]
+                    if code:
+                        global_tried_codes.add(code)
+    # Load valid codes
     if os.path.exists(VALID_FILE):
         with open(VALID_FILE, "r", encoding="utf-8") as f:
             for line in f:
-                code = line.strip().split()[0]
-                if code:
-                    global_valid_codes.add(code)
-                    global_tried_codes.add(code)
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if parts:
+                    code = parts[0]
+                    if code:
+                        global_valid_codes.add(code)
+                        global_tried_codes.add(code)
     print(f"Loaded {len(global_tried_codes)} total tried codes")
 
 def save_to_notvalid(code):
